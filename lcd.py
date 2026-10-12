@@ -40,7 +40,6 @@ PETG  = 2
 TPU   = 3
 PROBE = 4
 
-
 class _printerData():
     hotend_target   = None
     hotend          = None
@@ -96,6 +95,8 @@ class LCDEvents():
     SQUARE_CORNER_VELOCITY = 27
     THUMBNAIL      = 28
     CONSOLE        = 29
+    POWER_STATUS   = 30
+    POWER_CHANGE   = 31
 
 
 class LCD:
@@ -183,6 +184,7 @@ class LCD:
         self.askprint = False
         # Make sure the serial port closes when you quit the program.
         atexit.register(self._atexit)
+        self.current_page = None
 
     def _atexit(self):
         self.ser.close()
@@ -195,6 +197,13 @@ class LCD:
 
         #self.write(b'page boot')
         self.write("page boot")
+        
+        # Через 120 секунд бездействия переводим дисплей в сон
+        self.write("thsp=120")
+        
+        # Разрешаем пробуждение касанием
+        self.write("thup=1")
+
         self.write(b'com_star')
         self.write(b'main.va0.val=1')
         self.write("boot.j0.val=1")
@@ -213,17 +222,25 @@ class LCD:
 
     def write(self, data, eol=True, lf=False):
         dat = bytearray()
-        if type(data) == str:
-            dat.extend(map(ord, data))
+
+        if isinstance(data, str):
+            dat.extend(data.encode('utf-8', errors='replace'))
         else:
             dat.extend(data)
 
         if lf:
             dat.extend(dat[-1:])
             dat.extend(dat[-1:])
-            dat[len(dat)-2] = 10 #'\r'
-            dat[len(dat)-3] = 13 #'\n'
+            dat[len(dat)-2] = 10
+            dat[len(dat)-3] = 13
+
         self.ser.write(dat)
+
+        if isinstance(data, str) and data.startswith("page "):
+            self.current_page = data[5:].strip()
+
+        # print("TX:", dat.hex(" "), flush=True)
+
         if eol:
             self.ser.write(bytearray([0xFF, 0xFF, 0xFF]))
 
@@ -421,47 +438,74 @@ class LCD:
         self.write("leveling.tm0.en=0")
 
     def run(self):
+        nextion_error = bytearray()
+
         while self.running:
-                incomingByte = self.ser.read(1)
-                #
-                if self.rx_state == RX_STATE_IDLE:
-                    if incomingByte[0] == FHONE:
-                        self.rx_buf.extend(incomingByte)
-                    elif incomingByte[0] == FHTWO:
-                        if self.rx_buf[0] == FHONE:
-                            self.rx_buf.extend(incomingByte)
-                            self.rx_state = RX_STATE_READ_LEN
-                        else:
-                            self.rx_buf.clear()
-                            print("Unexpected header received: 0x%02x ()" % incomingByte[0])         
+            incomingByte = self.ser.read(1)
+
+            if not incomingByte:
+                continue
+
+            byte = incomingByte[0]
+
+            if self.rx_state == RX_STATE_IDLE:
+
+                # Продолжение ответа Nextion
+                if nextion_error:
+                    nextion_error.append(byte)
+
+                    if nextion_error == b'\x1a\xff\xff\xff':
+                        print("LCD ERROR: Invalid variable name (0x1A)")
+                        self.error_from_lcd = True
+                        nextion_error.clear()
+
+                    elif not b'\x1a\xff\xff\xff'.startswith(nextion_error):
+                        print("Unexpected LCD response:", nextion_error.hex(' '))
+                        nextion_error.clear()
+
+                    continue
+
+                # Начало ответа Nextion
+                if byte == 0x1A:
+                    nextion_error.append(byte)
+                    continue
+
+                # Основной бинарный протокол дисплея
+                if byte == FHONE:
+                    self.rx_buf.clear()
+                    self.rx_buf.append(byte)
+
+                elif byte == FHTWO:
+                    if self.rx_buf and self.rx_buf[0] == FHONE:
+                        self.rx_buf.append(byte)
+                        self.rx_state = RX_STATE_READ_LEN
                     else:
                         self.rx_buf.clear()
-                        self.error_from_lcd = True
-                        print("Unexpected data received: 0x%02x" % incomingByte[0])
-                #
-                elif self.rx_state == RX_STATE_READ_LEN:
-                    # Check if len is as expected, seems to alway be 6 bytes?
-                    #if incomingByte[0] == FHLEN:
-                    self.rx_buf.extend(incomingByte) # Read length
-                    self.rx_state = RX_STATE_READ_DAT
-                    #else:
-                    #    self.rx_buf.clear()
-                    #    self.rx_state = RX_STATE_IDLE
-                    #    print("Unexpected len param received: 0x%02x" % incomingByte[0])
-                #
-                elif self.rx_state == RX_STATE_READ_DAT:
-                    self.rx_buf.extend(incomingByte)
-                    self.rx_data_cnt += 1
-                    len = self.rx_buf[2]
-                    if self.rx_data_cnt >= len:
-                        # New command/message received from display
-                        cmd = self.rx_buf[3]
-                        data = self.rx_buf[-(len-1):] # Remove header and command
-                        # Handle incoming data
-                        self._handle_command(cmd, data)
-                        self.rx_buf.clear()
-                        self.rx_data_cnt = 0
-                        self.rx_state = RX_STATE_IDLE
+                        print("Unexpected header received: 0x%02x" % byte)
+
+                else:
+                    self.rx_buf.clear()
+                    print("Unexpected data received: 0x%02x" % byte)
+
+            elif self.rx_state == RX_STATE_READ_LEN:
+                self.rx_buf.append(byte)
+                self.rx_state = RX_STATE_READ_DAT
+
+            elif self.rx_state == RX_STATE_READ_DAT:
+                self.rx_buf.append(byte)
+                self.rx_data_cnt += 1
+
+                data_len = self.rx_buf[2]
+
+                if self.rx_data_cnt >= data_len:
+                    cmd = self.rx_buf[3]
+                    data = self.rx_buf[-(data_len - 1):]
+
+                    self._handle_command(cmd, data)
+
+                    self.rx_buf.clear()
+                    self.rx_data_cnt = 0
+                    self.rx_state = RX_STATE_IDLE
 
     def _handle_command(self, cmd, dat):
         if cmd == CMD_WRITEVAR: #0x82
@@ -511,12 +555,20 @@ class LCD:
     def _MainPage(self, data):
         if data[0] == 1: # Print
             # Request files
+            print("Запрос файлов...")
             files = self.callback(self.evt.FILES)
+            files = files[:MaxFileNumber] if files else []
             self.files = files
+
+            # Очистка старых записей
+            for i in range(MaxFileNumber):
+                page_num = (i // 5) + 1
+                self.write('file%d.t%d.txt=""' % (page_num, i))
+
             if (files):
                 i = 0
                 for file in files:
-                    print(file)
+                    # print(file)
                     page_num = ((i / 5) + 1)
                     self.write("file%d.t%d.txt=\"%s\"" % (page_num, i, file))
                     i += 1
@@ -822,11 +874,15 @@ class LCD:
         elif data[0] == 0x06: # Motor release
             self.callback(self.evt.MOTOR_OFF)
         elif data[0] == 0x07: # Fan Control
-            
+            #print("Pass. Fan control")
+            self.callback(self.evt.POWER_CHANGE)
             pass
         elif data[0] == 0x08: 
-            print("What is this???")
-            pass
+            #print("Включение/выключение принтера")
+            #if self.current_page == "main":
+            pass    
+            #else:
+            #    print("Игнорируем POWER_CHANGE, страница:", self.current_page)
         elif data[0] == 0x09: # 
             self.write("page pretemp")
             self.write("pretemp.nozzle.txt=\"%d\"" % self.printer.hotend_target)
@@ -837,6 +893,7 @@ class LCD:
             self.write("prefilament.filamentspeed.txt=\"%d\"" % self.feedrate_e)
         elif data[0] == 0x0b:
             self.write("page set")
+            self.callback(self.evt.POWER_STATUS)
         elif data[0] == 0x0c:
             self.write("page warn_rdlevel")
         elif data[0] == 0x0d: # Advanced Settings
@@ -1094,7 +1151,7 @@ class LCD:
 
 
 if __name__ == "__main__":
-    lcd = LCD("/dev/ttyUSB0", baud=115200)
+    lcd = LCD("/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0", baud=115200)
     lcd.start()
 
     lcd.ser.write(b'page boot')

@@ -10,9 +10,10 @@ from lcd import LCD, _printerData
 
 class KlipperLCD ():
     def __init__(self):
-        self.lcd = LCD("/dev/ttyAMA0", callback=self.lcd_callback)
+        # Указать путь к устройству
+        self.lcd = LCD("/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0", callback=self.lcd_callback)
         self.lcd.start()
-        self.printer = PrinterData('XXXXXX', URL=("127.0.0.1"), klippy_sock='/home/pi/printer_data/comms/klippy.sock', callback=self.printer_callback)
+        self.printer = PrinterData('XXXXXX', URL=("127.0.0.1"), klippy_sock='/home/biqu/printer_data/comms/klippy.sock', callback=self.printer_callback)
         self.running = False
         self.wait_probe = False
         self.thumbnail_inprogress = False
@@ -24,6 +25,7 @@ class KlipperLCD ():
             time.sleep(1)
 
         self.printer.init_Webservices()
+        self.printer.init_power_device()
         gcode_store = self.printer.get_gcode_store()
         self.lcd.write_gcode_store(gcode_store)
 
@@ -217,6 +219,18 @@ class KlipperLCD ():
             self.printer.sendGCode("SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=%.1f" % data)
         elif evt == self.lcd.evt.CONSOLE:
             self.printer.sendGCode(data)
+        elif evt == self.lcd.evt.POWER_STATUS:
+            try:
+                enabled = self.printer.get_power_state()
+                self.lcd.write("set.va0.val=%d" % int(enabled))
+            except Exception as e:
+                print("Ошибка получения состояния питания:", e)
+        elif evt == self.lcd.evt.POWER_CHANGE:
+            try:
+                enabled = self.printer.toggle_power()
+                self.lcd.write("set.va0.val=%d" % int(enabled))
+            except Exception as e:
+                print("Ошибка переключения питания:", e)
         else:
             print("lcd_callback event not recognised %d" % evt)
 

@@ -252,11 +252,14 @@ class PrinterData:
 		self.job_Info               = None
 		self.file_path              = None
 		self.file_name              = None
+		self.estimated_time         = 0
+		self.cached_filename        = None
 		self.status                 = None
 		self.max_velocity           = None
 		self.max_accel              = None
 		self.max_accel_to_decel     = None
 		self.square_corner_velocity = None
+		self.power_device           = None
 		
 		self.op = MoonrakerSocket(URL, 80, API_Key)
 		print(self.op.base_address)
@@ -436,8 +439,61 @@ class PrinterData:
 		self.Y_MAX_POS = int(volume[1])
 		self.max_velocity           = toolhead['max_velocity']
 		self.max_accel              = toolhead['max_accel']
-		self.max_accel_to_decel     = toolhead['max_accel_to_decel']
+		self.max_accel_to_decel = toolhead.get('max_accel_to_decel', toolhead.get('minimum_cruise_ratio', 0))
 		self.square_corner_velocity = toolhead['square_corner_velocity']
+
+	def init_power_device(self):
+		"""Определение устройства питания."""
+		devices = self.getREST('/machine/device_power/devices')['result']['devices']
+
+		if not devices:
+			print("Moonraker: устройства питания не найдены")
+			self.power_device = None
+			return
+
+		if len(devices) > 1:
+			print("Moonraker: найдено несколько устройств питания:",
+				[d['device'] for d in devices])
+			self.power_device = None
+			return
+
+		self.power_device = devices[0]['device']
+		print("Moonraker: устройство питания:", self.power_device)
+
+
+	def get_power_state(self):
+		"""Получение текущего состояния питания."""
+		if not self.power_device:
+			raise ValueError("Устройство питания не определено")
+
+		devices = self.getREST('/machine/device_power/devices')['result']['devices']
+
+		for item in devices:
+			if item['device'] == self.power_device:
+				if item['status'] == 'on':
+					return True
+				if item['status'] == 'off':
+					return False
+				raise ValueError("Неизвестное состояние: %s" % item['status'])
+
+		raise ValueError("Устройство питания не найдено: %s" % self.power_device)
+
+
+	def toggle_power(self):
+		"""Переключение питания."""
+		enabled = not self.get_power_state()
+
+		response = self.op.s.post(
+			self.op.base_address + '/machine/device_power/device',
+			params={
+				'device': self.power_device,
+				'action': 'on' if enabled else 'off'
+			},
+			timeout=5
+		)
+		response.raise_for_status()
+
+		return self.get_power_state()
 
 	def get_gcode_store(self, count=100):
 		gcode_store = None
@@ -468,7 +524,7 @@ class PrinterData:
 	def GetFiles(self, refresh=False):
 		if not self.files or refresh:
 			try:
-				self.files = self.getREST('/server/files/list')["result"]
+				self.files = sorted(self.getREST('/server/files/list')["result"], key=lambda x: x['modified'], reverse=True)
 			except:
 				print("Exception 418")
 		names = []
@@ -551,12 +607,26 @@ class PrinterData:
 		return Update
 
 	def getState(self):
+		if self.power_device:
+			try:
+				if not self.get_power_state():
+					return "standby"
+			except Exception as e:
+				print("Ошибка проверки питания:", e)
+
 		if self.job_Info:
 			return self.job_Info['print_stats']['state']
 		else:
 			return None
 
 	def printingIsPaused(self):
+		if self.power_device:
+			try:
+				if not self.get_power_state():
+					return "standby"
+			except Exception as e:
+				print("Ошибка проверки питания:", e)
+
 		if self.job_Info:
 			return self.job_Info['print_stats']['state'] == "paused" or self.job_Info['print_stats']['state'] == "pausing"
 		else:
@@ -568,6 +638,17 @@ class PrinterData:
 				return self.job_Info['virtual_sdcard']['progress'] * 100
 		return 0
 
+	def get_estimated_time(self):
+		if self.file_name and self.file_name != self.cached_filename:
+			try:
+				import urllib.parse
+				metadata = self.getREST('/server/files/metadata?filename=%s' % urllib.parse.quote(self.file_name))['result']
+				self.estimated_time = metadata.get('estimated_time', 0)
+				self.cached_filename = self.file_name
+			except:
+				self.estimated_time = 0
+		return self.estimated_time
+
 	def duration(self):
 		if self.job_Info:
 			if self.job_Info['virtual_sdcard']['is_active']:
@@ -575,8 +656,13 @@ class PrinterData:
 		return 0
 
 	def remain(self):
-		percent = self.getPercent()
 		duration = self.duration()
+		estimated = self.get_estimated_time()
+		if estimated:
+			remaining = estimated - duration
+			if remaining > 0:
+				return remaining
+		percent = self.getPercent()
 		if percent:
 			total = duration / (percent / 100)
 			return total - duration
@@ -609,9 +695,9 @@ class PrinterData:
 	def set_led(self, led):
 		self.led_percentage = led
 		if(led > 0):
-			self.sendGCode('SET_LED LED=top_LEDs WHITE=0.5 SYNC=0 TRANSMIT=1')
+			self.sendGCode('SET_LED LED=LED_Light WHITE=0.5 SYNC=0 TRANSMIT=1')
 		else:
-			self.sendGCode('SET_LED LED=top_LEDs WHITE=0 SYNC=0 TRANSMIT=1')
+			self.sendGCode('SET_LED LED=LED_Light WHITE=0 SYNC=0 TRANSMIT=1')
 
 	def set_fan(self, fan):
 		self.fan_percentage = fan
